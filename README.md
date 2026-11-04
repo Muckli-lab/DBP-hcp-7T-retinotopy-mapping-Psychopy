@@ -16,14 +16,16 @@ Press a response key or mouse button whenever the central dot changes color. **E
 
 For a quick demonstration, tick **Windowed preview**, set **Lead-in seconds** to `2`, and **Preview duration** to `30`. Windowed mode is explicitly uncalibrated. For the full protocol, leave lead-in at `-1` and duration blank.
 
-| Run | Label | Stimulus |
-| --- | --- | --- |
-| 1 | RETBAR1 | Sweeping bars, first pass |
-| 2 | RETBAR2 | Sweeping bars, second pass |
-| 3 | RETCCW | Counter-clockwise wedge |
-| 4 | RETCW | Clockwise wedge |
-| 5 | RETEXP | Expanding rings |
-| 6 | RETCON | Contracting rings |
+
+| Run | Label | Retinotopy Stimulus | Phase Encoding | Duration (min:sec) |
+| --- | --- | --- | --- | --- |
+| RET1 | RETCCW | Counter-clockwise wedge sweep | AP | 5:00 |
+| RET2 | RETCW | Clockwise wedge sweep | PA | 5:00 |
+| RET3 | RETEXP | Expanding rings | AP | 5:00 |
+| RET4 | RETCON | Contracting rings | PA | 5:00 |
+| RET5 | RETBAR1 | Multidirectional sweeping bars, first pass | AP | 5:00 |
+| RET6 | RETBAR2 | Multidirectional sweeping bars, second pass (same stimulus as RETBAR1) | PA | 5:00 |
+
 
 Each complete run contains 4,500 stimulus steps at 15 Hz: **300 seconds**. Initial fixation-only baseline is 16 seconds for bars and 22 seconds for wedges/rings. A single invocation runs one selected run.
 
