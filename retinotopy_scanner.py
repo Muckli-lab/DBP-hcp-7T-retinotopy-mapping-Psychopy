@@ -11,6 +11,7 @@ import csv
 from datetime import datetime, timezone
 import json
 import math
+import sys
 from pathlib import Path
 from time import perf_counter
 
@@ -123,15 +124,14 @@ def parse_args(argv=None):
     p.add_argument("--windowed", action="store_true", help="Uncalibrated 1024x768 preview")
     p.add_argument("--lead-in", type=float, default=-1, help="Negative keeps full baseline; preview: 2")
     p.add_argument("--duration", type=float, help="Preview duration, seconds (default: entire schedule)")
-    p.add_argument("--keyboard-preview", dest="scanner", action="store_false",
-                   help="Use keyboard start instead of PROPixx TTL (preview only)")
+    p.add_argument("--no-vpixx", "--keyboard-preview", dest="scanner", action="store_false",
+                   help="Use Space or a keyboard trigger for start; GMPD3 remains active")
+    p.add_argument("--gamepad-index", type=int, default=-1, help="SDL joystick index (-1 for automatic selection)")
     p.set_defaults(scanner=True)
     p.add_argument("--trigger-bit", type=int, choices=range(16), default=4, help="Scanner DIN bit, zero based")
     p.add_argument("--trigger-level", type=int, choices=(0, 1), default=0, help="Active scanner level: 0=low, 1=high")
-    p.add_argument("--button-level", type=int, choices=(0, 1), default=0, help="Active button-box level")
     p.add_argument("--skip-triggers", type=int, default=0, help="Ignore N fresh pulses, then start on pulse N+1")
     p.add_argument("--trigger", default="", help="Keyboard preview start key; blank uses Space")
-    p.add_argument("--response-keys", default="", help="Comma-separated keys; blank: any non-trigger key")
     p.add_argument("--no-dialog", action="store_true")
     p.add_argument("--validate-only", action="store_true", help="Check schedule/assets without PsychoPy")
     a = p.parse_args(argv)
@@ -151,11 +151,17 @@ def validate_args(a):
         raise ValueError("Subject and display must be nonnegative.")
     if a.skip_triggers < 0:
         raise ValueError("skip_triggers must be nonnegative.")
-    if not 0 <= a.trigger_bit <= 15 or a.trigger_level not in (0, 1) or a.button_level not in (0, 1):
+    if not 0 <= a.trigger_bit <= 15 or a.trigger_level not in (0, 1):
         raise ValueError("DIN bit must be 0-15; active levels must be 0 or 1.")
     a.trigger = a.trigger.strip().lower()
     if a.trigger == "escape":
         raise ValueError("Escape is reserved for ending the run.")
+
+
+def json_scalar(value):
+    if isinstance(value, (np.integer, np.floating, np.bool_)):
+        return value.item()
+    raise TypeError(f"Unsupported session metadata type {type(value).__name__}")
 
 
 def save_csv(path, fields, rows):
@@ -179,13 +185,12 @@ def run_experiment(a):
                 "Display index": a.display, "Windowed preview": a.windowed,
                 "Lead-in seconds (-1 = full)": a.lead_in,
                 "Preview duration (blank = full)": "" if a.duration is None else str(a.duration),
-                "Use scanner (PROPixx TTL)": a.scanner,
+                "Use VPixx for scanner trigger": a.scanner,
                 "Scanner DIN bit (zero based)": a.trigger_bit,
                 "Scanner active level (0=low, 1=high)": a.trigger_level,
-                "Button active level (0=low, 1=high)": a.button_level,
+                "GMPD3 device index (-1 = auto)": a.gamepad_index,
                 "Skip initial scanner pulses": a.skip_triggers,
-                "Preview key (blank = Space)": a.trigger,
-                "Response keys (blank = any)": a.response_keys}
+                "Non-VPixx start key (blank = Space)": a.trigger}
         if not gui.DlgFromDict(info, title="Retinotopy - PsychoPy", sortKeys=False).OK:
             return
         a.subject = int(info["Subject ID"])
@@ -196,13 +201,12 @@ def run_experiment(a):
         a.windowed = bool(info["Windowed preview"])
         a.lead_in = float(info["Lead-in seconds (-1 = full)"])
         a.duration = float(info["Preview duration (blank = full)"]) if str(info["Preview duration (blank = full)"]).strip() else None
-        a.scanner = bool(info["Use scanner (PROPixx TTL)"])
+        a.scanner = bool(info["Use VPixx for scanner trigger"])
         a.trigger_bit = int(info["Scanner DIN bit (zero based)"])
         a.trigger_level = int(info["Scanner active level (0=low, 1=high)"])
-        a.button_level = int(info["Button active level (0=low, 1=high)"])
+        a.gamepad_index = int(info["GMPD3 device index (-1 = auto)"])
         a.skip_triggers = int(info["Skip initial scanner pulses"])
-        a.trigger = str(info["Preview key (blank = Space)"])
-        a.response_keys = str(info["Response keys (blank = any)"])
+        a.trigger = str(info["Non-VPixx start key (blank = Space)"])
     validate_args(a)
     rows, dropped = load_orders(a.assets, a.subject, a.run, a.lead_in, a.duration)
     a.output.mkdir(parents=True, exist_ok=True)
@@ -214,12 +218,15 @@ def run_experiment(a):
                 planned_steps=len(rows), planned_duration_s=len(rows)/RATE, status="initializing",
                 geometry_calibrated=not a.windowed, utc_started=stamp)
     steps, responses, flips = [], [], []
-    win = scanner = None
+    win = scanner = pad = None
     scanner_events = []
     pulse_count = 0
     start_trigger = start_sync = None
     first_flip_host = None
     try:
+        from gmpd3_input import Gamepad
+        pad = Gamepad(a.gamepad_index)
+        meta.update(response_device="GMPD3", gamepad_name=pad.name, gamepad_index=pad.index)
         monitor = monitors.Monitor("retinotopy_session", width=a.screen_width, distance=a.viewing_distance)
         win = visual.Window(size=(1024, 768), fullscr=not a.windowed, screen=a.display,
                             monitor=monitor, units="pix", color=(128, 128, 128), colorSpace="rgb255",
@@ -227,7 +234,6 @@ def run_experiment(a):
         win.mouseVisible = False
         clock = core.Clock()
         kb = keyboard.Keyboard(clock=clock)
-        mouse = event.Mouse(win=win, visible=False)
         text = visual.TextStim(win, color="white", height=24, wrapWidth=min(900, win.size[0]-60), autoLog=False)
 
         def status(message):
@@ -241,6 +247,8 @@ def run_experiment(a):
             """Keep all pulses, including several edges returned in one batch."""
             nonlocal start_trigger, start_sync, pulse_count
             for item in scanner.read():
+                if item["kind"] not in ("trigger", "trigger_release"):
+                    continue
                 if item["kind"] == "trigger":
                     pulse_count += 1
                     item["pulse_number"] = pulse_count
@@ -293,9 +301,12 @@ def run_experiment(a):
         if a.scanner:
             status("Connecting to scanner input...\nDo not start the scanner yet.\nEscape exits.")
             from scanner_input import ScannerInput
-            scanner = ScannerInput(a.trigger_bit, a.trigger_level, a.button_level)
+            scanner = ScannerInput(a.trigger_bit, a.trigger_level)
             # Finish loading, texture uploads and refresh measurement before
             # arming. The device now retains edges even during the ready flip.
+            meta.update(python_version=sys.version.split()[0], python_executable=sys.executable,
+                        pypixxlib_version=scanner.package_version, din_log_mode="Classic",
+                        din_log_backend=scanner.log_backend)
             scanner.arm()
             meta["scanner_armed_device_time_s"] = scanner.armed_time
         wait_message = (f"Waiting for scanner TTL: DIN bit {a.trigger_bit}, active {a.trigger_level}\n"
@@ -312,8 +323,13 @@ def run_experiment(a):
                 if key.name == "escape":
                     raise KeyboardInterrupt
                 if not a.scanner and key.name == start_key:
+                    if a.trigger:
+                        pulse_count += 1
+                        if pulse_count <= a.skip_triggers:
+                            continue
                     start_press = key
                     break
+            pad.read()  # Discard responses before stimulus onset; surface disconnects.
             if scanner is not None:
                 read_scanner()
             if start_trigger is None and start_press is None:
@@ -328,8 +344,7 @@ def run_experiment(a):
         kb.clearEvents()
         win.callOnFlip(begin)
         win.recordFrameIntervals = True
-        previous_buttons = mouse.getPressed()
-        accepted_keys = {s.strip().lower() for s in a.response_keys.split(",") if s.strip()}
+        pad.read()  # Flush any pre-run button events immediately before presenting.
         current = -1
         first_flip = None
         previous_dot = None
@@ -379,13 +394,11 @@ def run_experiment(a):
                 kind = "trigger" if not a.scanner and a.trigger and key.name == a.trigger else "keypress"
                 if key.name == "escape":
                     kind, abort = "abort", True
-                if kind != "keypress" or not accepted_keys or key.name in accepted_keys:
+                if kind in ("trigger", "abort"):
                     responses.append({"time_s": key.rt, "kind": kind, "key": key.name})
-            buttons = mouse.getPressed()
-            for button, (now, before) in enumerate(zip(buttons, previous_buttons)):
-                if now and not before:
-                    responses.append({"time_s": clock.getTime(), "kind": "mousepress", "key": button+1})
-            previous_buttons = buttons
+            for button in pad.read():
+                responses.append({"time_s": clock.getTime(), "kind": "gmpd3_press",
+                                  "key": button, "timing_source": "host_poll"})
             if scanner is not None:
                 read_scanner()  # Hardware retained every edge since the last read.
             if ending or abort:
@@ -428,9 +441,8 @@ def run_experiment(a):
                                        if device_first_flip is not None else "")
             item["host_detection_since_flip_s"] = (item["host_detected_s"]-first_flip_host
                                                     if first_flip_host is not None else "")
-            if item["kind"] == "boxpress" and device_first_flip is not None and item["time_s_estimate"] >= 0:
-                responses.append({"time_s": item["time_s_estimate"], "kind": "boxpress", "key": item["key"],
-                                  "timing_source": "vpixx_clock_mapping_estimate"})
+        if pad is not None:
+            pad.close()
         if win is not None:
             meta["psychopy_dropped_refreshes"] = int(win.nDroppedFrames)
             win.close()
@@ -465,7 +477,7 @@ def run_experiment(a):
         responses.sort(key=lambda response: response["time_s"])
         save_csv(str(stem)+"_responses.csv", ["time_s", "kind", "key", "step_index", "since_dot_change_s", "timing_source"], responses)
         save_csv(str(stem)+"_flips.csv", ["flip_index", "onset_s", "interval_s", "step_index"], flips)
-        Path(str(stem)+"_session.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        Path(str(stem)+"_session.json").write_text(json.dumps(meta, indent=2, default=json_scalar), encoding="utf-8")
         print(f"{meta['status']}: saved {stem}_*.csv and _session.json")
 
 
